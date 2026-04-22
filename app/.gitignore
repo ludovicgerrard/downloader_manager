@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+
+# Cargo lock (keep this if it's a binary project - which it is)
+# Cargo.lock  ← DO NOT ignore this for binaries, commit it
+
+# Environment variables (if you add any later)
+.env
+.env.*
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+~*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temp files from our downloader (just in case)
+*.tmp
+dl_*/
