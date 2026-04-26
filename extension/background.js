@@ -1,166 +1,364 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// SwiftDL — Background Service Worker
-// Intercepts downloads, collects headers, sends job to local Rust downloader
+// SwiftDL — Background Script (Manifest V2, persistent)
+// Sniffs all video URLs at network level + intercepts browser downloads
+// Routes everything to the local Rust manager on localhost:6543
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MANAGER_URL = "http://localhost:6543";
 const DEFAULT_CHUNKS = 8;
 
-// Store request headers captured by webRequest listener
-// key: url → value: { headers: [], tabId, pageUrl }
-const requestHeadersCache = new Map();
+// ── State ─────────────────────────────────────────────────────────────────────
+// key: url → { url, type, filename, timestamp, tabId, headers }
+let detectedVideos = new Map();
 
-// ─── 1. Capture outgoing request headers before they leave the browser ────────
+// key: url → { headers: [{name,value}], tabId, initiator }
+let requestHeadersCache = new Map();
+
+// ─── 1. Capture outgoing request headers for every request ───────────────────
+// This gives us cookies, auth tokens, referer etc. for any URL
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
-    // Store headers keyed by URL so we can retrieve them when the download fires
     requestHeadersCache.set(details.url, {
       headers: details.requestHeaders || [],
       tabId: details.tabId,
       initiator: details.initiator || "",
     });
 
-    // Keep cache lean — remove entries older than 2 minutes
-    pruneCache();
+    // Prune old entries (older than 5 min)
+    const cutoff = Date.now() - 300_000;
+    for (const [url, data] of requestHeadersCache) {
+      if (data.timestamp && data.timestamp < cutoff) {
+        requestHeadersCache.delete(url);
+      }
+    }
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders", "extraHeaders"]
+  ["requestHeaders"],
 );
 
-// ─── 2. Intercept every new download ─────────────────────────────────────────
+// ─── 2. Sniff video URLs from network requests (catches iframes too) ──────────
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    const url = details.url;
+    if (details.tabId < 0) return {};
+
+    if (isVideoUrl(url)) {
+      storeVideo(
+        url,
+        getTypeFromUrl(url),
+        null,
+        details.tabId,
+        details.requestHeaders || [],
+      );
+    }
+
+    return {};
+  },
+  { urls: ["<all_urls>"] },
+  ["requestBody"],
+);
+
+// ─── 3. Also sniff from response Content-Type (catches dynamic/signed URLs) ──
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+
+    const contentType = getHeader(details.responseHeaders, "content-type");
+    const contentDisposition = getHeader(
+      details.responseHeaders,
+      "content-disposition",
+    );
+
+    if (contentType && isVideoContentType(contentType)) {
+      const filename = extractFilename(details.url, contentDisposition);
+      // Merge response headers with any cached request headers
+      const cached = requestHeadersCache.get(details.url) || {};
+      const allHeaders = [
+        ...(cached.headers || []),
+        ...(details.responseHeaders || []),
+      ];
+      storeVideo(details.url, contentType, filename, details.tabId, allHeaders);
+    }
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"],
+);
+
+// ─── 4. Intercept browser downloads → redirect to SwiftDL manager ────────────
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    // Only intercept main-frame/sub-frame GET requests that look like files
+    // (downloads triggered by the browser show up here as type "main_frame" with
+    //  a Content-Disposition: attachment response — we handle that separately)
+    return {};
+  },
+  { urls: ["<all_urls>"] },
+  ["blocking"],
+);
+
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
-  // Check if the extension is enabled
-  const { enabled } = await chrome.storage.local.get({ enabled: true });
+  const { enabled } = await storageGet({ enabled: true });
   if (!enabled) return;
 
   const url = downloadItem.url;
-
-  // Skip blob: and data: URLs — these can't be re-downloaded by the manager
   if (url.startsWith("blob:") || url.startsWith("data:")) return;
-
-  // Skip already-cancelled items
-  if (downloadItem.state === "interrupted") return;
 
   console.log("[SwiftDL] Intercepted download:", url);
 
-  // Cancel the browser's own download immediately
   chrome.downloads.cancel(downloadItem.id, async () => {
-    // Remove the cancelled item from the downloads shelf
     chrome.downloads.erase({ id: downloadItem.id });
 
-    // Check if the manager is alive before sending
     const alive = await pingManager();
     if (!alive) {
-      showNotification(
+      notify(
         "SwiftDL — Manager offline",
-        "Start the SwiftDL manager app first, then try again."
+        "Start the SwiftDL app first, then try again.",
       );
       return;
     }
 
-    // Build the job
-    const job = await buildJob(downloadItem);
-
-    // Send to the Rust downloader
+    const job = await buildJob(url, null, downloadItem.tabId || -1);
     const result = await sendToManager(job);
 
     if (result.success) {
-      showNotification(
-        "SwiftDL — Download started",
-        `${job.filename || extractFilename(url)} is being downloaded.`
-      );
+      notify("SwiftDL — Download started", extractFilename(url) || url);
     } else {
-      showNotification(
-        "SwiftDL — Error",
-        `Failed to start download: ${result.message}`
-      );
+      notify("SwiftDL — Error", result.message);
     }
   });
 });
 
-// ─── 3. Build a complete job from the download item ──────────────────────────
-async function buildJob(downloadItem) {
-  const url = downloadItem.url;
+// ─── 5. Store a detected video, notify popup ──────────────────────────────────
+function storeVideo(url, type, filename, tabId, headers) {
+  // Skip tiny segment files (.ts chunks in HLS — we want the .m3u8 playlist)
+  // but keep individual .mp4 etc.
+  if (url.includes(".ts?") || url.match(/\/seg\d+\.ts$/)) return;
+  if (detectedVideos.has(url)) return; // already stored
 
-  // Get stored request headers for this URL
+  const name = filename || extractFilename(url) || `video_${Date.now()}`;
+
+  detectedVideos.set(url, {
+    url,
+    type: type || "video/unknown",
+    filename: name,
+    timestamp: Date.now(),
+    tabId,
+    headers, // raw [{name, value}] array
+  });
+
+  console.log("[SwiftDL] Video detected:", url);
+
+  // Notify popup if open
+  chrome.runtime
+    .sendMessage({
+      action: "videoDetected",
+      video: { url, type, filename: name, timestamp: Date.now() },
+    })
+    .catch(() => {});
+}
+
+// ─── 6. Build a SwiftDL job — attach all available headers ───────────────────
+async function buildJob(url, filename, tabId) {
   const cached = requestHeadersCache.get(url) || {};
-  let headers = cached.headers || [];
+  const videoData = detectedVideos.get(url) || {};
 
-  // Get cookies for the URL's domain and add them to headers
+  // Merge: cached request headers + video-specific headers
+  let headers = [...(cached.headers || []), ...(videoData.headers || [])];
+
+  // Add cookies for the URL's domain
   const cookieHeader = await getCookiesForUrl(url);
   if (cookieHeader) {
-    // Replace or add Cookie header
-    headers = headers.filter(
-      (h) => h.name.toLowerCase() !== "cookie"
-    );
+    headers = headers.filter((h) => h.name.toLowerCase() !== "cookie");
     headers.push({ name: "Cookie", value: cookieHeader });
   }
 
-  // Always include a Referer if we know the page that triggered the download
-  const tabInfo = cached.tabId ? await getTabUrl(cached.tabId) : null;
-  if (tabInfo) {
-    headers = headers.filter(
-      (h) => h.name.toLowerCase() !== "referer"
-    );
-    headers.push({ name: "Referer", value: tabInfo });
+  // Add Referer from the tab that triggered the video
+  const effectiveTabId =
+    tabId >= 0 ? tabId : cached.tabId || videoData.tabId || -1;
+  const pageUrl = await getTabUrl(effectiveTabId);
+  if (pageUrl) {
+    headers = headers.filter((h) => h.name.toLowerCase() !== "referer");
+    headers.push({ name: "Referer", value: pageUrl });
+    headers = headers.filter((h) => h.name.toLowerCase() !== "origin");
+    headers.push({ name: "Origin", value: new URL(pageUrl).origin });
   }
 
-  // Convert from [{name, value}] to [[name, value]] format for our Rust server
+  // Convert [{name,value}] → [[name,value]] and strip forbidden headers
   const headerPairs = headers
     .filter((h) => h.name && h.value)
     .filter((h) => !isForbiddenHeader(h.name))
     .map((h) => [h.name, h.value]);
 
-  // Get chunk count from settings
-  const { chunks } = await chrome.storage.local.get({ chunks: DEFAULT_CHUNKS });
+  // Deduplicate header pairs (keep last value for each name)
+  const headerMap = new Map();
+  for (const [k, v] of headerPairs) {
+    headerMap.set(k.toLowerCase(), [k, v]);
+  }
+
+  const { chunks } = await storageGet({ chunks: DEFAULT_CHUNKS });
 
   return {
     url,
-    filename: downloadItem.filename
-      ? extractFilename(downloadItem.filename)
-      : extractFilename(url),
-    headers: headerPairs,
+    filename: filename || videoData.filename || extractFilename(url),
+    headers: Array.from(headerMap.values()),
     chunks: parseInt(chunks),
   };
 }
 
-// ─── 4. Send job to the Rust manager ─────────────────────────────────────────
+// ─── 7. Send job to Rust manager ──────────────────────────────────────────────
 async function sendToManager(job) {
   try {
-    const response = await fetch(`${MANAGER_URL}/download`, {
+    const res = await fetch(`${MANAGER_URL}/download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(job),
     });
-
-    if (!response.ok) {
-      return { success: false, message: `HTTP ${response.status}` };
-    }
-
-    return await response.json();
+    if (!res.ok) return { success: false, message: `HTTP ${res.status}` };
+    return await res.json();
   } catch (err) {
-    console.error("[SwiftDL] Failed to reach manager:", err);
     return { success: false, message: err.message };
   }
 }
 
-// ─── 5. Ping the manager to check if it's running ────────────────────────────
-async function pingManager() {
-  try {
-    const res = await fetch(`${MANAGER_URL}/ping`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    return res.ok;
-  } catch {
+// ─── 8. Message handler — popup communicates here ────────────────────────────
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === "videoDetected") {
+    // From content.js — store video detected in the page DOM
+    const v = request.video;
+    if (v && v.url) {
+      const cached = requestHeadersCache.get(v.url) || {};
+      storeVideo(
+        v.url,
+        v.type,
+        v.filename || null,
+        sender.tab?.id || -1,
+        cached.headers || [],
+      );
+    }
     return false;
   }
+
+  if (request.action === "getVideos") {
+    sendResponse({ videos: Array.from(detectedVideos.values()) });
+    return false;
+  }
+
+  if (request.action === "clearVideos") {
+    detectedVideos.clear();
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (request.action === "pingManager") {
+    pingManager().then(sendResponse);
+    return true; // async
+  }
+
+  if (request.action === "getStatus") {
+    fetch(`${MANAGER_URL}/status`)
+      .then((r) => r.json())
+      .then(sendResponse)
+      .catch(() => sendResponse([]));
+    return true; // async
+  }
+
+  if (request.action === "downloadVideo") {
+    // Popup clicked Download on a detected video
+    const { url, filename, tabId } = request;
+
+    pingManager().then((alive) => {
+      if (!alive) {
+        notify("SwiftDL — Manager offline", "Start the SwiftDL app first.");
+        sendResponse({ success: false, message: "Manager offline" });
+        return;
+      }
+
+      buildJob(url, filename, tabId || -1).then((job) => {
+        sendToManager(job).then((result) => {
+          if (result.success) {
+            notify("SwiftDL — Download started", job.filename || url);
+          } else {
+            notify("SwiftDL — Error", result.message);
+          }
+          sendResponse(result);
+        });
+      });
+    });
+
+    return true; // async
+  }
+
+  if (request.action === "downloadDirect") {
+    // Extension-intercepted regular download
+    const { url, tabId } = request;
+    buildJob(url, null, tabId || -1).then((job) => {
+      sendToManager(job).then(sendResponse);
+    });
+    return true;
+  }
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function isVideoUrl(url) {
+  const u = url.toLowerCase().split("?")[0];
+  return /\.(mp4|webm|mkv|mov|m4v|avi|flv|wmv|ogv|m3u8|mpd|m3u|f4v|f4m)$/.test(
+    u,
+  );
 }
 
-// ─── 6. Get all cookies for a URL and format as Cookie header string ──────────
+function isVideoContentType(ct) {
+  const t = ct.toLowerCase();
+  return (
+    t.startsWith("video/") ||
+    t.includes("application/vnd.apple.mpegurl") ||
+    t.includes("application/x-mpegurl") ||
+    t.includes("application/dash+xml") ||
+    t.includes("video/mp2t")
+  );
+}
+
+function getTypeFromUrl(url) {
+  const u = url.toLowerCase();
+  if (u.includes(".mp4")) return "video/mp4";
+  if (u.includes(".webm")) return "video/webm";
+  if (u.includes(".mkv")) return "video/x-matroska";
+  if (u.includes(".m3u8")) return "application/x-mpegURL";
+  if (u.includes(".mpd")) return "application/dash+xml";
+  if (u.includes(".ts")) return "video/mp2t";
+  return "video/unknown";
+}
+
+function getHeader(headers, name) {
+  if (!headers) return null;
+  const n = name.toLowerCase();
+  const h = headers.find((h) => h.name.toLowerCase() === n);
+  return h ? h.value : null;
+}
+
+function extractFilename(url, contentDisposition) {
+  // Try Content-Disposition first
+  if (contentDisposition) {
+    const m = contentDisposition.match(
+      /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/,
+    );
+    if (m && m[1]) return m[1].replace(/['"]/g, "").trim();
+  }
+  // From URL path
+  try {
+    const path = new URL(url).pathname;
+    const seg = path.split("/").filter(Boolean).pop() || "";
+    if (seg.includes(".")) return decodeURIComponent(seg);
+  } catch {}
+  return null;
+}
+
 async function getCookiesForUrl(url) {
   try {
-    const urlObj = new URL(url);
-    const cookies = await chrome.cookies.getAll({ domain: urlObj.hostname });
+    const { hostname } = new URL(url);
+    const cookies = await new Promise((r) =>
+      chrome.cookies.getAll({ domain: hostname }, r),
+    );
     if (!cookies || cookies.length === 0) return null;
     return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   } catch {
@@ -168,19 +366,38 @@ async function getCookiesForUrl(url) {
   }
 }
 
-// ─── 7. Get the URL of the tab that triggered the download ───────────────────
 async function getTabUrl(tabId) {
   if (!tabId || tabId < 0) return null;
   try {
-    const tab = await chrome.tabs.get(tabId);
+    const tab = await new Promise((r) => chrome.tabs.get(tabId, r));
     return tab?.url || null;
   } catch {
     return null;
   }
 }
 
-// ─── 8. Show a browser notification ──────────────────────────────────────────
-function showNotification(title, message) {
+function isForbiddenHeader(name) {
+  const forbidden = new Set([
+    "accept-charset",
+    "accept-encoding",
+    "access-control-request-headers",
+    "access-control-request-method",
+    "connection",
+    "content-length",
+    "date",
+    "expect",
+    "host",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "via",
+  ]);
+  return forbidden.has(name.toLowerCase());
+}
+
+function notify(title, message) {
   chrome.notifications.create({
     type: "basic",
     iconUrl: "icons/icon48.png",
@@ -189,71 +406,23 @@ function showNotification(title, message) {
   });
 }
 
-// ─── 9. Extract filename from path or URL ────────────────────────────────────
-function extractFilename(pathOrUrl) {
+async function pingManager() {
   try {
-    // Try as a full URL first
-    const url = new URL(pathOrUrl);
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length > 0) return decodeURIComponent(parts[parts.length - 1]);
+    const res = await fetch(`${MANAGER_URL}/ping`);
+    return res.ok;
   } catch {
-    // Fall back: treat as a file path
-    const parts = pathOrUrl.replace(/\\/g, "/").split("/");
-    return parts[parts.length - 1] || "download";
-  }
-  return "download";
-}
-
-// ─── 10. Headers that browsers block from being read/set ─────────────────────
-function isForbiddenHeader(name) {
-  const forbidden = [
-    "accept-charset",
-    "accept-encoding",
-    "access-control-request-headers",
-    "access-control-request-method",
-    "connection",
-    "content-length",
-    "date",
-    "dnt",
-    "expect",
-    "feature-policy",
-    "host",
-    "keep-alive",
-    "origin",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "via",
-  ];
-  return forbidden.includes(name.toLowerCase());
-}
-
-// ─── 11. Prune old cache entries ──────────────────────────────────────────────
-const cacheTimestamps = new Map();
-
-function pruneCache() {
-  const now = Date.now();
-  for (const [url, ts] of cacheTimestamps.entries()) {
-    if (now - ts > 120_000) {
-      requestHeadersCache.delete(url);
-      cacheTimestamps.delete(url);
-    }
+    return false;
   }
 }
 
-// Listen for messages from the popup
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === "PING_MANAGER") {
-    pingManager().then(sendResponse);
-    return true; // keep channel open for async response
-  }
+function storageGet(defaults) {
+  return new Promise((resolve) => chrome.storage.local.get(defaults, resolve));
+}
 
-  if (message.type === "GET_STATUS") {
-    fetch(`${MANAGER_URL}/status`)
-      .then((r) => r.json())
-      .then(sendResponse)
-      .catch(() => sendResponse([]));
-    return true;
+// ─── Clean up old video entries every 5 minutes ───────────────────────────────
+setInterval(() => {
+  const cutoff = Date.now() - 3_600_000; // 1 hour
+  for (const [url, data] of detectedVideos) {
+    if (data.timestamp < cutoff) detectedVideos.delete(url);
   }
-});
+}, 300_000);
